@@ -1,0 +1,144 @@
+/*
+ * Copyright © 2010 - 2013 Apama Ltd.
+ * Copyright © 2013 - 2018 Software AG, Darmstadt, Germany and/or its licensors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.                                                            
+ *
+ */
+
+def skipRemainingStages = false
+pipeline {
+  agent any
+  options {
+    skipDefaultCheckout(true)
+  }
+  environment {
+    def BUILD_DATE = sh(script: "date +'%d%m%y'", returnStdout: true).trim()
+    COMMAND = "ant -DprojectName=${env.JOB_NAME}_${env.BUILD_DATE}_${env.BUILD_NUMBER} -DbuildNumber=${env.BUILD_NUMBER} -DjobName=${env.JOB_NAME}"
+  }
+
+  stages {
+    stage('Check: SCM') {
+      steps {
+        script {
+          def changesfound = false
+          def gitUrl = null
+          try {
+            logData("Checking for git URL")
+            gitUrl = sh(script: 'git config --get remote.origin.url', returnStdout: true).trim()
+            logData("Git URL: " + gitUrl)
+          }
+          catch (Exception e) {
+            logData("Git URL not found. Initiating checkout scm " + e.getMessage())
+            checkout scm
+            logData("Checkout complete...")
+            gitUrl = sh(script: 'git config --get remote.origin.url', returnStdout: true).trim()
+            changesfound = true
+            logData("Found Git URL " + gitUrl + ". Considering changes found action")
+          }
+          def localGitHash = sh(script: 'git rev-parse --verify HEAD', returnStdout: true).trim()
+          def remoteUrl = "git ls-remote -h -- " + gitUrl + " | grep master"
+          def allHashRemote = sh(script: remoteUrl, returnStdout: true).trim()
+          if (allHashRemote.contains(localGitHash) && !changesfound) {
+            logData("No changes found in repository. Setting skip remaining flag as true.")
+            currentBuild.result = 'SUCCESS'
+            skipRemainingStages = true
+          }
+          else if (changesfound) {
+            logData("Changes found but checkout alredy done")
+          }
+          else {
+            logData("Changes found and initiating checkout operation.")
+            checkout scm
+            logData("Checkout complete...")
+          }
+        }
+
+      }
+    }
+    stage('Dependency: Deploy') {
+      when {
+        expression {
+          !skipRemainingStages
+        }
+      }
+      steps {
+        script {
+          logData("Initiating dependency check.")
+          def inside = false
+          def filename = "assets/IS/Packages/${currentBuild.projectName}/manifest.v3"
+          def data = readFile(file: filename)
+          def lines = data.readLines()
+          for (line in lines) {
+            if (line.contains("record name=\"requires\"") || inside) {
+              if (line.contains("</record>")) {
+                inside = false
+                break
+              }
+              if (!inside) {
+                inside = true
+                continue
+              }
+              String[] str;
+              str = line.split('"');
+              println(str[1])
+              if (!skipRemainingStages) {
+                try {
+                  logData("Starting build operation for package: " + str[1])
+                  build(job: str[1], parameters: [])
+                  logData("Build success for package: " + str[1])
+                }
+                catch (Exception e) {
+                  logData("Build failed with error "+ e +": " + str[1])
+                  logData("Skiping remaining changes")
+                  //currentBuild.result = 'FAILURE'
+                  //skipRemainingStages = true
+                  //sh "exit 4"
+                }
+              }
+              else {
+                logData("Skip remaining changes is true. So no action will be taken")
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Build') {
+      when {
+        expression {
+          !skipRemainingStages
+        }
+      }
+      steps {
+        sh "${COMMAND} build"
+      }
+    }
+    stage('Deploy') {
+      when {
+        expression {
+          !skipRemainingStages
+        }
+      }
+      steps {
+        sh "${COMMAND} deploy"
+      }
+    }
+  }
+}
+
+def logData(dataToLog) {
+  echo "Log: " + dataToLog
+}
